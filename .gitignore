@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary upload and output folders
+uploads/*
+!uploads/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# Excel, PDF and Image temporary artifacts
+*.xlsx
+*.xls
+temp_*.png
+temp_*.jpg
+*.log
+
+# Environments
+venv/
+env/
+.venv/
