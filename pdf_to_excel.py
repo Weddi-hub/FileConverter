@@ -197,7 +197,7 @@ def extract_paa_metadata(first_page: pdfplumber.page.Page) -> Dict[str, str]:
 def extract_paa_lh_flight_page(page: pdfplumber.page.Page) -> List[List[str]]:
     """Extracts flight log records from a Landing & Housing page."""
     words = page.extract_words()
-    data_words = [w for w in words if 246 <= w['top'] <= 550]
+    data_words = [w for w in words if 245 <= w['top'] <= 580]
     if not data_words:
         return []
 
@@ -437,7 +437,30 @@ def build_exact_paa_excel(pdf_path: str, output_excel_path: str, sheet_name: str
         is_grand_total = "LOCATION TOTAL" in row_vals[1]
 
         for col_idx, val in enumerate(row_vals, start=1):
-            cell = ws.cell(row=current_data_row, column=col_idx, value=val)
+            cell_val = val
+            num_fmt = None
+            if val and isinstance(val, str):
+                cleaned_val = val.replace(",", "").strip()
+                if col_idx >= 11:  # LANDING, REFUELING, PARKING, TERMINAL, TOTAL CHARGES
+                    try:
+                        if "." in cleaned_val:
+                            cell_val = float(cleaned_val)
+                            num_fmt = "#,##0.00"
+                        else:
+                            cell_val = int(cleaned_val)
+                            num_fmt = "#,##0"
+                    except ValueError:
+                        pass
+                elif col_idx == 4 and not is_subtotal and not is_grand_total:  # MTOW
+                    try:
+                        cell_val = float(cleaned_val) if "." in cleaned_val else int(cleaned_val)
+                        num_fmt = "#,##0"
+                    except ValueError:
+                        pass
+
+            cell = ws.cell(row=current_data_row, column=col_idx, value=cell_val)
+            if num_fmt:
+                cell.number_format = num_fmt
 
             if is_grand_total:
                 cell.font = Font(name="Calibri", size=10, bold=True)
@@ -450,12 +473,20 @@ def build_exact_paa_excel(pdf_path: str, output_excel_path: str, sheet_name: str
             else:
                 cell.font = Font(name="Calibri", size=9)
 
-            if col_idx in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-            elif col_idx >= 11:
-                cell.alignment = Alignment(horizontal="right", vertical="center")
+            if is_subtotal or is_grand_total:
+                if col_idx == 2:
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                elif col_idx >= 11:
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
             else:
-                cell.alignment = Alignment(horizontal="left", vertical="center")
+                if col_idx in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_idx >= 11:
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
 
         current_data_row += 1
 
@@ -499,7 +530,7 @@ def build_exact_paa_excel(pdf_path: str, output_excel_path: str, sheet_name: str
 def extract_paa_an_flight_page(page: pdfplumber.page.Page) -> List[List[str]]:
     """Extracts flight records from an Air Navigation page (12 columns)."""
     words = page.extract_words()
-    data_words = [w for w in words if 242 <= w['top'] <= 545]
+    data_words = [w for w in words if 235 <= w['top'] <= 580]
     if not data_words:
         return []
 
@@ -514,10 +545,12 @@ def extract_paa_an_flight_page(page: pdfplumber.page.Page) -> List[List[str]]:
         elif abs(w['top'] - curr_top) <= 5.0:
             curr_line.append(w)
         else:
+            curr_line.sort(key=lambda x: x['x0'])
             lines.append(curr_line)
             curr_line = [w]
             curr_top = w['top']
     if curr_line:
+        curr_line.sort(key=lambda x: x['x0'])
         lines.append(curr_line)
 
     page_rows: List[List[str]] = []
@@ -526,8 +559,8 @@ def extract_paa_an_flight_page(page: pdfplumber.page.Page) -> List[List[str]]:
         row = [""] * len(PAA_AN_COL_INTERVALS)
 
         if "TOTAL :" in line_text or "GRAND TOTAL" in line_text:
-            desc_words = [w['text'] for w in line if w['x0'] < 520]
-            num_words = [w for w in line if w['x0'] >= 520]
+            desc_words = [w['text'] for w in line if w['x0'] < 650]
+            num_words = [w for w in line if w['x0'] >= 650]
             row[1] = " ".join(desc_words)
             for w in num_words:
                 cx = (w['x0'] + w['x1']) / 2
@@ -676,7 +709,43 @@ def build_air_nav_excel(pdf_path: str, output_excel_path: str, sheet_name: str =
         is_grand_total = "GRAND TOTAL" in row_vals[1]
 
         for col_idx, val in enumerate(row_vals, start=1):
-            cell = ws.cell(row=current_data_row, column=col_idx, value=val)
+            cell_val = val
+            num_fmt = None
+            if val and isinstance(val, str):
+                cleaned_val = val.replace(",", "").strip()
+                if col_idx in [9, 10]:  # TOTAL DISTANCE, BILLABLE DISTANCE
+                    try:
+                        cell_val = float(cleaned_val)
+                        num_fmt = "#,##0.0000"
+                    except ValueError:
+                        pass
+                elif col_idx == 11:  # AMOUNT (US$)
+                    try:
+                        cell_val = float(cleaned_val)
+                        num_fmt = "#,##0.0000"
+                    except ValueError:
+                        pass
+                elif col_idx == 12:  # AMOUNT (Rs)
+                    try:
+                        if "." in cleaned_val:
+                            cell_val = float(cleaned_val)
+                            num_fmt = "#,##0.00"
+                        else:
+                            cell_val = int(cleaned_val)
+                            num_fmt = "#,##0"
+                    except ValueError:
+                        pass
+                elif col_idx == 6 and not is_subtotal and not is_grand_total:  # MTOW (TONS)
+                    try:
+                        cell_val = float(cleaned_val) if "." in cleaned_val else int(cleaned_val)
+                        num_fmt = "#,##0"
+                    except ValueError:
+                        pass
+
+            cell = ws.cell(row=current_data_row, column=col_idx, value=cell_val)
+            if num_fmt:
+                cell.number_format = num_fmt
+
             if is_grand_total:
                 cell.font = Font(name="Calibri", size=10, bold=True)
                 cell.fill = PatternFill(start_color="EAEAEA", end_color="EAEAEA", fill_type="solid")
@@ -688,12 +757,20 @@ def build_air_nav_excel(pdf_path: str, output_excel_path: str, sheet_name: str =
             else:
                 cell.font = Font(name="Calibri", size=9)
 
-            if col_idx in [1, 2, 3, 4, 5, 6, 7]:
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-            elif col_idx in [8]:
-                cell.alignment = Alignment(horizontal="left", vertical="center")
+            if is_subtotal or is_grand_total:
+                if col_idx == 2:
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                elif col_idx in [11, 12]:
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
             else:
-                cell.alignment = Alignment(horizontal="right", vertical="center")
+                if col_idx in [1, 2, 3, 4, 5, 6, 7]:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_idx in [8]:
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
 
         current_data_row += 1
 

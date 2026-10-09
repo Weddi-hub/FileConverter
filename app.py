@@ -557,6 +557,5 @@ if __name__ == "__main__":
     logger.info("Purging stale temporary files on startup...")
     purge_expired_files(max_age_seconds=0)
     start_storage_janitor()
-    port = int(os.environ.get("PORT", 5000))
-    logger.info(f"Starting PDF to Excel Converter Web Server on http://0.0.0.0:{port} ...")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    logger.info("Starting PDF to Excel Converter Web Server on http://127.0.0.1:5000 ...")
+    app.run(host="127.0.0.1", port=5000, debug=False)

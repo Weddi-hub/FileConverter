@@ -100,6 +100,15 @@ class TestPDFToExcelConverter(unittest.TestCase):
         self.assertEqual(ws["A11"].value, "BILL ITEM ID")
         self.assertEqual(ws["L11"].value, "AMOUNT (Rs)")
         self.assertGreater(ws.max_row, 130)
+
+        # Total 140 flights
+        flight_rows = [r for r in range(12, ws.max_row + 1) if ws.cell(r, 1).value and str(ws.cell(r, 1).value).isdigit()]
+        self.assertEqual(len(flight_rows), 140, "Must extract all 140 flight records in PAA Air Navigation Bill")
+
+        # Verify numeric typing and exact mathematical sum in Rupees
+        rs_amounts = [ws.cell(r, 12).value for r in flight_rows]
+        self.assertTrue(all(isinstance(v, (int, float)) for v in rs_amounts), "Col 12 must be native numeric")
+        self.assertEqual(sum(rs_amounts), 35271810, "Sum of all 140 flights in Rupees must equal exactly 35,271,810")
         wb.close()
 
     def test_paa_landing_and_housing_bill(self):
@@ -120,6 +129,30 @@ class TestPDFToExcelConverter(unittest.TestCase):
         self.assertEqual(ws["A10"].value, "BILL ITEM ID")
         self.assertIn("TOTAL CHARGES", str(ws["O10"].value))
         self.assertGreater(ws.max_row, 40)
+
+        # Ensure row 148493004 is completely parsed with all columns
+        row_148493004 = None
+        for r in range(12, ws.max_row + 1):
+            if ws.cell(r, 1).value == "148493004":
+                row_148493004 = [ws.cell(r, c).value for c in range(1, 16)]
+                break
+        self.assertIsNotNone(row_148493004, "Entry 148493004 must be parsed")
+        self.assertEqual(row_148493004[0], "148493004")
+        self.assertEqual(row_148493004[1], "A-320")
+        self.assertEqual(row_148493004[2], "APEDA")
+        self.assertIn(row_148493004[3], ["74", 74])
+        self.assertEqual(row_148493004[4], "PA703")
+        self.assertEqual(row_148493004[5], "12/6/26")
+        self.assertEqual(row_148493004[6], "12/6/26")
+        self.assertIn(row_148493004[10], ["6,882", 6882])
+        self.assertIn(row_148493004[11], ["0", 0])
+        self.assertIn(row_148493004[12], ["1,274", 1274])
+        self.assertIn(row_148493004[13], ["750", 750])
+        self.assertIn(row_148493004[14], ["8,906", 8906])
+
+        # Total 44 flights
+        flight_ids = [ws.cell(r, 1).value for r in range(12, ws.max_row + 1) if ws.cell(r, 1).value and str(ws.cell(r, 1).value).isdigit()]
+        self.assertEqual(len(flight_ids), 44, "Must extract all 44 flight records in PAA Domestic Bill")
         wb.close()
 
     def test_dammam_landing_charge_invoice(self):
