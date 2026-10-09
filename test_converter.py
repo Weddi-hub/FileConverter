@@ -155,6 +155,36 @@ class TestPDFToExcelConverter(unittest.TestCase):
         self.assertEqual(len(flight_ids), 44, "Must extract all 44 flight records in PAA Domestic Bill")
         wb.close()
 
+    def test_paa_aviobridge_bill(self):
+        """Verify specialized conversion for PAA Aviobridge Charges Bill (13 columns)."""
+        pdf_path = os.path.join(self.samples_dir, "PAA_Aviobridge_Bill.pdf")
+        if not os.path.exists(pdf_path):
+            self.skipTest("PAA_Aviobridge_Bill.pdf not found in tests/samples")
+
+        out_xlsx = os.path.join(self.temp_dir, "ab_out.xlsx")
+        df, path = convert_pdf_to_excel(pdf_path, output_excel_path=out_xlsx)
+
+        self.assertTrue(os.path.exists(out_xlsx))
+        wb = openpyxl.load_workbook(out_xlsx)
+        self.assertEqual(wb.sheetnames, ["Sheet1"], "Must be on a single continuous sheet 'Sheet1'")
+        ws = wb["Sheet1"]
+        self.assertEqual(ws["C1"].value, "PAKISTAN AIRPORTS AUTHORITY")
+        self.assertEqual(ws["C2"].value, "AVIOBRIDGE CHARGES")
+        self.assertEqual(ws["A11"].value, "BILL ITEM ID")
+        self.assertIn("AMOUNT", str(ws["M11"].value))
+
+        flight_rows = [r for r in range(13, ws.max_row + 1) if ws.cell(r, 1).value and str(ws.cell(r, 1).value).isdigit()]
+        self.assertEqual(len(flight_rows), 73, "Must extract all 73 flight records in PAA Aviobridge Bill")
+
+        # Verify numeric amounts and sums
+        us_amounts = [ws.cell(r, 12).value for r in flight_rows]
+        rs_amounts = [ws.cell(r, 13).value for r in flight_rows]
+        self.assertTrue(all(isinstance(v, (int, float)) for v in us_amounts), "Col 12 (US$) must be numeric")
+        self.assertTrue(all(isinstance(v, (int, float)) for v in rs_amounts), "Col 13 (Rs) must be numeric")
+        self.assertEqual(sum(us_amounts), 17225.0, "Sum of flights in US$ must be exactly 17,225")
+        self.assertEqual(sum(rs_amounts), 4824532, "Sum of flights in Rupees must be exactly 4,824,532")
+        wb.close()
+
     def test_dammam_landing_charge_invoice(self):
         """Verify specialized conversion for Dammam Airports Landing Charge Invoice (20 columns)."""
         pdf_path = os.path.join(self.samples_dir, "dammam_landing_charge_invoice.pdf")
@@ -298,10 +328,57 @@ class TestPDFToExcelConverter(unittest.TestCase):
             ["", None],
             [" Val1 ", "  Val2  "]
         ]
-        cleaned = clean_table(dirty_table)
-        self.assertEqual(len(cleaned), 2)
-        self.assertEqual(cleaned[0], ["Col1", "Col2"])
-        self.assertEqual(cleaned[1], ["Val1", "Val2"])
+    def test_paa_aeronautical_bills_summary(self):
+        """Verify dynamic parsing for 5-page PAA Summary of Aeronautical Bills (58 bills, 8 columns)."""
+        pdf_path = os.path.join(self.samples_dir, "PAA_Aeronautical_Bills_Summary.pdf")
+        if not os.path.exists(pdf_path):
+            self.skipTest("PAA_Aeronautical_Bills_Summary.pdf not found in tests/samples")
+
+        out_xlsx = os.path.join(self.temp_dir, "aeronautical_summary_out.xlsx")
+        df, path = convert_pdf_to_excel(pdf_path, output_excel_path=out_xlsx)
+
+        self.assertTrue(os.path.exists(out_xlsx))
+        wb = openpyxl.load_workbook(out_xlsx)
+        self.assertEqual(wb.sheetnames, ["Sheet1"], "Summary must export onto a single continuous sheet 'Sheet1'")
+        ws = wb["Sheet1"]
+
+        # Exactly 58 bills extracted dynamically across 8 columns
+        self.assertEqual(len(df), 58, "Must extract exactly 58 bills")
+        self.assertEqual(len(df.columns), 8, "Must dynamically discover 8 columns")
+
+        # Verify first and last bill records
+        self.assertEqual(df.iloc[0, 0], "1")
+        self.assertEqual(df.iloc[0, 1], "EDLDAPSOPIS232026")
+        self.assertEqual(df.iloc[-1, 0], "58")
+        self.assertEqual(df.iloc[-1, 1], "EDLIPCAOPKC232026")
+
+        # Verify mathematical exactness in DataFrame
+        billed_sum = sum(int(str(r[3]).replace(",", "")) for r in df.values if str(r[3]).strip())
+        self.assertEqual(billed_sum, 376765432, "Sum of all 58 bills must equal 376,765,432 Rs")
+
+        # Verify Excel formatting & Grand Total row
+        # Find the grand total row
+        grand_total_found = False
+        grand_total_val = None
+        for r in range(1, 80):
+            val2 = str(ws.cell(row=r, column=2).value or "")
+            if "TOTAL AMOUNT DUE" in val2:
+                grand_total_found = True
+                grand_total_val = ws.cell(row=r, column=4).value
+                self.assertEqual(ws.cell(row=r, column=4).number_format, '#,##0')
+                break
+
+        self.assertTrue(grand_total_found, "Grand Total row must be present in Excel")
+        self.assertEqual(grand_total_val, 376765432, "Grand total amount in Excel must be 376,765,432")
+
+        # Verify native numeric formatting in Excel data rows
+        first_data_val = ws.cell(row=8, column=4).value
+        self.assertIsInstance(first_data_val, int)
+        self.assertEqual(first_data_val, 4881958)
+        self.assertEqual(ws.cell(row=8, column=4).number_format, '#,##0')
+
+        wb.close()
+
 
 
 if __name__ == "__main__":

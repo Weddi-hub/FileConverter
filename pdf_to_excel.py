@@ -84,6 +84,26 @@ PAA_AN_COL_INTERVALS = [
 ]
 PAA_AN_HEADERS = [c[0] for c in PAA_AN_COL_INTERVALS]
 
+# ==============================================================================
+# 1C. PAA AVIOBRIDGE CHARGES BILL CONFIGURATION (13 COLUMNS)
+# ==============================================================================
+PAA_AB_COL_INTERVALS = [
+    ("BILL ITEM ID", 0, 55.0),
+    ("AIRCRAFT TYPE", 55.0, 100.0),
+    ("AIRCRAFT REG. #", 100.0, 160.0),
+    ("AIRCRAFT MTOW", 160.0, 205.0),
+    ("FLIGHT NO.", 205.0, 285.0),
+    ("ARRIVAL DATE", 285.0, 350.0),
+    ("DEPARTURE DATE", 350.0, 425.0),
+    ("BRIDGE NO.", 425.0, 500.0),
+    ("PLUG IN", 500.0, 555.0),
+    ("PLUG OUT", 555.0, 610.0),
+    ("PLUG TOTAL", 610.0, 675.0),
+    ("AMOUNT US$", 675.0, 750.0),
+    ("AMOUNT PKR Rs.", 750.0, 825.0),
+]
+PAA_AB_HEADERS = [c[0] for c in PAA_AB_COL_INTERVALS]
+
 
 def detect_document_type(first_page_text: str) -> str:
     """Classifies the PDF into specific bill types or generic document."""
@@ -113,12 +133,22 @@ def detect_document_type(first_page_text: str) -> str:
         return "DUBAI_AIRPORTS"
     elif "AIR NAVIGATION FOR LANDING" in text_upper or ("ENTRY-EXIT" in text_upper and "DISTANCE" in text_upper):
         return "PAA_AIR_NAVIGATION"
+    elif "AVIOBRIDGE CHARGES" in text_upper or "AVIOBRIDGE" in text_upper or "BRIDGE NO." in text_upper:
+        return "PAA_AVIOBRIDGE"
+    elif "SUMMARY OF AERONAUTICAL BILLS" in text_upper or "SUMMARY OF BILLS" in text_upper:
+        return "PAA_AERONAUTICAL_SUMMARY"
     elif "LANDING AND HOUSING" in text_upper or "ENGINE TIME" in text_upper:
         return "PAA_LANDING_AND_HOUSING"
     elif "PAKISTAN AIRPORTS AUTHORITY" in text_upper:
+        if "SUMMARY OF AERONAUTICAL BILLS" in text_upper or "SUMMARY OF BILLS" in text_upper:
+            return "PAA_AERONAUTICAL_SUMMARY"
         if "DISTANCE" in text_upper or "ROUTE" in text_upper:
             return "PAA_AIR_NAVIGATION"
-        return "PAA_LANDING_AND_HOUSING"
+        if "AVIOBRIDGE" in text_upper or "BRIDGE" in text_upper:
+            return "PAA_AVIOBRIDGE"
+        if "LANDING AND HOUSING" in text_upper or "ENGINE TIME" in text_upper:
+            return "PAA_LANDING_AND_HOUSING"
+        return "DYNAMIC_DOCUMENT"
     return "GENERIC"
 
 
@@ -144,6 +174,8 @@ def extract_paa_metadata(first_page: pdfplumber.page.Page) -> Dict[str, str]:
 
     if "AIR NAVIGATION FOR LANDING" in text.upper():
         meta["subtitle"] = "AIR NAVIGATION FOR LANDING"
+    elif "AVIOBRIDGE" in text.upper():
+        meta["subtitle"] = "AVIOBRIDGE CHARGES"
     elif "LANDING AND HOUSING" in text.upper():
         meta["subtitle"] = "LANDING AND HOUSING"
 
@@ -809,6 +841,325 @@ def build_air_nav_excel(pdf_path: str, output_excel_path: str, sheet_name: str =
 
 
 # ==============================================================================
+# 1D. PAA AVIOBRIDGE CHARGES BILL EXTRACTION (13 COLUMNS)
+# ==============================================================================
+def extract_paa_ab_flight_page(page: pdfplumber.page.Page) -> List[List[str]]:
+    """Extracts flight records from an Aviobridge Charges page (13 columns)."""
+    words = page.extract_words()
+    data_words = [w for w in words if 265 <= w['top'] <= 580]
+    if not data_words:
+        return []
+    data_words.sort(key=lambda w: (w['top'], w['x0']))
+    lines = []
+    curr_line = []
+    curr_top = None
+    for w in data_words:
+        if curr_top is None:
+            curr_top = w['top']
+            curr_line.append(w)
+        elif abs(w['top'] - curr_top) <= 5.0:
+            curr_line.append(w)
+        else:
+            curr_line.sort(key=lambda x: x['x0'])
+            lines.append(curr_line)
+            curr_line = [w]
+            curr_top = w['top']
+    if curr_line:
+        curr_line.sort(key=lambda x: x['x0'])
+        lines.append(curr_line)
+
+    page_rows: List[List[str]] = []
+    for line in lines:
+        line_text = " ".join(w['text'] for w in line)
+        row = [""] * len(PAA_AB_COL_INTERVALS)
+
+        if "AIRCRAFT TYPE TOTAL" in line_text or "GRAND TOTAL" in line_text:
+            desc_words = [w['text'] for w in line if w['x0'] < 650]
+            num_words = [w for w in line if w['x0'] >= 650]
+            row[1] = " ".join(desc_words)
+            for w in num_words:
+                cx = (w['x0'] + w['x1']) / 2
+                for c_idx, (_, x0, x1) in enumerate(PAA_AB_COL_INTERVALS):
+                    if x0 <= cx < x1:
+                        row[c_idx] = w['text']
+                        break
+        else:
+            for w in line:
+                cx = (w['x0'] + w['x1']) / 2
+                for c_idx, (_, x0, x1) in enumerate(PAA_AB_COL_INTERVALS):
+                    if x0 <= cx < x1:
+                        if row[c_idx]:
+                            row[c_idx] += " " + w['text']
+                        else:
+                            row[c_idx] = w['text']
+                        break
+            # Clean PLUG TOTAL: e.g. "1 :21" -> "1:21"
+            if row[10]:
+                row[10] = row[10].replace(" :", ":").replace(": ", ":")
+
+        if any(row):
+            page_rows.append(row)
+
+    return page_rows
+
+
+def build_aviobridge_excel(pdf_path: str, output_excel_path: str, sheet_name: str = "Sheet1") -> Tuple[pd.DataFrame, str]:
+    """Builds the high-fidelity Excel export for PAA Aviobridge Charges bills (13 columns)."""
+    parent_dir = os.path.dirname(os.path.abspath(output_excel_path))
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
+
+    all_flight_rows = []
+    summary_rows = []
+    logo_path = None
+
+    with pdfplumber.open(pdf_path) as pdf:
+        meta = extract_paa_metadata(pdf.pages[0])
+        if "AVIOBRIDGE" in (pdf.pages[0].extract_text() or "").upper():
+            meta["subtitle"] = "AVIOBRIDGE CHARGES"
+
+        if pdf.pages[0].images:
+            try:
+                img_obj = pdf.pages[0].images[0]
+                temp_logo = os.path.join(parent_dir, "paa_logo_temp_ab.png")
+                cropped_img = pdf.pages[0].crop((img_obj['x0'], img_obj['top'], img_obj['x1'], img_obj['bottom'])).to_image(resolution=150)
+                cropped_img.save(temp_logo)
+                logo_path = temp_logo
+            except Exception:
+                logo_path = None
+
+        for idx, page in enumerate(pdf.pages):
+            page_num = idx + 1
+            text = page.extract_text() or ""
+            if "AMOUNT WITHIN" in text:
+                s_rows = extract_paa_summary_page(page, len(PAA_AB_COL_INTERVALS))
+                if s_rows:
+                    logger.info(f"Page {page_num}/{len(pdf.pages)}: Extracted invoice summary details")
+                    summary_rows.extend(s_rows)
+            elif "BRIDGE" in text and "PLUG" in text:
+                rows = extract_paa_ab_flight_page(page)
+                logger.info(f"Page {page_num}/{len(pdf.pages)}: Extracted {len(rows)} flight/subtotal records")
+                all_flight_rows.extend(rows)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+    ws.views.sheetView[0].showGridLines = True
+
+    thin_border = Side(style='thin', color='000000')
+    double_border = Side(style='double', color='000000')
+    cell_border = Border(left=thin_border, right=thin_border, top=thin_border, bottom=thin_border)
+    top_bottom_border = Border(top=thin_border, bottom=thin_border)
+    grand_total_border = Border(top=thin_border, bottom=double_border)
+
+    # 1. Logo
+    if logo_path and os.path.exists(logo_path):
+        try:
+            from openpyxl.drawing.image import Image as ExcelImage
+            img = ExcelImage(logo_path)
+            img.width = 110
+            img.height = 55
+            ws.add_image(img, "A1")
+        except Exception:
+            pass
+
+    # 2. Title Block
+    ws.merge_cells("C1:J1")
+    ws["C1"] = meta.get("title", "PAKISTAN AIRPORTS AUTHORITY")
+    ws["C1"].font = Font(name="Calibri", size=14, bold=True)
+    ws["C1"].alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.merge_cells("C2:J2")
+    ws["C2"] = meta.get("subtitle", "AVIOBRIDGE CHARGES")
+    ws["C2"].font = Font(name="Calibri", size=12, bold=True)
+    ws["C2"].alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.merge_cells("C3:J3")
+    ws["C3"] = meta.get("bill_for", "BILL FOR THE FORTNIGHT : JUN01 - 2026")
+    ws["C3"].font = Font(name="Calibri", size=11, bold=True)
+    ws["C3"].alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.merge_cells("C4:J4")
+    ws["C4"] = meta.get("bill_type", "INTERNATIONAL")
+    ws["C4"].font = Font(name="Calibri", size=12, bold=True)
+    ws["C4"].alignment = Alignment(horizontal="center", vertical="center")
+
+    ws["L1"] = "PAA-001-FNBL-1.0"
+    ws["L1"].font = Font(name="Calibri", size=9)
+    ws["L1"].alignment = Alignment(horizontal="right")
+
+    # 3. Metadata Block
+    ws.row_dimensions[5].height = 10
+    meta_rows = [
+        ("AIRLINE NAME :", meta.get("airline_name", ""), "PROCESSING DATE :", meta.get("processing_date", "")),
+        ("BILL NO. :", meta.get("bill_no", ""), "ISSUE DATE :", meta.get("issue_date", "")),
+        ("LOCATION :", meta.get("location", ""), "DUE DATE :", meta.get("due_date", "")),
+    ]
+    if meta.get("dollar_rate"):
+        meta_rows.append(("", "", "DOLLAR CONVERSION RATE :", meta.get("dollar_rate", "")))
+
+    curr_row = 6
+    for lbl1, val1, lbl2, val2 in meta_rows:
+        if lbl1:
+            ws.cell(row=curr_row, column=2, value=lbl1).font = Font(name="Calibri", size=10, bold=True)
+            ws.cell(row=curr_row, column=3, value=val1).font = Font(name="Calibri", size=10, bold=False)
+        if lbl2:
+            ws.cell(row=curr_row, column=10, value=lbl2).font = Font(name="Calibri", size=10, bold=True)
+            ws.cell(row=curr_row, column=10).alignment = Alignment(horizontal="right")
+            ws.cell(row=curr_row, column=11, value=val2).font = Font(name="Calibri", size=10, bold=False)
+        curr_row += 1
+
+    curr_row += 1
+
+    # 4. Table Header (2 Rows)
+    header_row_1 = curr_row
+    header_row_2 = curr_row + 1
+    hdr_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+    hdr_font = Font(name="Calibri", size=9, bold=True)
+
+    for r in range(header_row_1, header_row_2 + 1):
+        for c in range(1, 14):
+            cell = ws.cell(row=r, column=c)
+            cell.fill = hdr_fill
+            cell.font = hdr_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = cell_border
+
+    ws.merge_cells(start_row=header_row_1, start_column=1, end_row=header_row_2, end_column=1)
+    ws.cell(row=header_row_1, column=1, value="BILL ITEM ID")
+
+    ws.merge_cells(start_row=header_row_1, start_column=2, end_row=header_row_1, end_column=4)
+    ws.cell(row=header_row_1, column=2, value="AIRCRAFT")
+
+    ws.merge_cells(start_row=header_row_1, start_column=5, end_row=header_row_2, end_column=5)
+    ws.cell(row=header_row_1, column=5, value="FLIGHT NO.")
+
+    ws.merge_cells(start_row=header_row_1, start_column=6, end_row=header_row_1, end_column=7)
+    ws.cell(row=header_row_1, column=6, value="DATE")
+
+    ws.merge_cells(start_row=header_row_1, start_column=8, end_row=header_row_2, end_column=8)
+    ws.cell(row=header_row_1, column=8, value="BRIDGE NO.")
+
+    ws.merge_cells(start_row=header_row_1, start_column=9, end_row=header_row_1, end_column=11)
+    ws.cell(row=header_row_1, column=9, value="PLUG")
+
+    ws.merge_cells(start_row=header_row_1, start_column=12, end_row=header_row_2, end_column=12)
+    ws.cell(row=header_row_1, column=12, value="AMOUNT\nUS$")
+
+    ws.merge_cells(start_row=header_row_1, start_column=13, end_row=header_row_2, end_column=13)
+    ws.cell(row=header_row_1, column=13, value="AMOUNT\nPKR Rs.")
+
+    ws.cell(row=header_row_2, column=2, value="TYPE")
+    ws.cell(row=header_row_2, column=3, value="REG. #")
+    ws.cell(row=header_row_2, column=4, value="MTOW")
+    ws.cell(row=header_row_2, column=6, value="ARRIVAL")
+    ws.cell(row=header_row_2, column=7, value="DEPARTURE")
+    ws.cell(row=header_row_2, column=9, value="IN (HH:MM)")
+    ws.cell(row=header_row_2, column=10, value="OUT (HH:MM)")
+    ws.cell(row=header_row_2, column=11, value="TOTAL (HH:MM)")
+
+    # 5. Data Rows
+    current_data_row = header_row_2 + 1
+    for row_vals in all_flight_rows:
+        is_subtotal = "AIRCRAFT TYPE TOTAL" in row_vals[1]
+        is_grand_total = "GRAND TOTAL" in row_vals[1]
+
+        for col_idx, val in enumerate(row_vals, start=1):
+            cell_val = val
+            num_fmt = None
+            if val and isinstance(val, str):
+                cleaned_val = val.replace(",", "").strip()
+                if col_idx == 12:  # AMOUNT US$
+                    try:
+                        cell_val = float(cleaned_val)
+                        num_fmt = "#,##0.0000"
+                    except ValueError:
+                        pass
+                elif col_idx == 13:  # AMOUNT PKR Rs.
+                    try:
+                        if "." in cleaned_val:
+                            cell_val = float(cleaned_val)
+                            num_fmt = "#,##0.00"
+                        else:
+                            cell_val = int(cleaned_val)
+                            num_fmt = "#,##0"
+                    except ValueError:
+                        pass
+                elif col_idx == 4 and not is_subtotal and not is_grand_total:  # MTOW
+                    try:
+                        cell_val = float(cleaned_val) if "." in cleaned_val else int(cleaned_val)
+                        num_fmt = "#,##0"
+                    except ValueError:
+                        pass
+
+            cell = ws.cell(row=current_data_row, column=col_idx, value=cell_val)
+            if num_fmt:
+                cell.number_format = num_fmt
+
+            if is_grand_total:
+                cell.font = Font(name="Calibri", size=10, bold=True)
+                cell.fill = PatternFill(start_color="EAEAEA", end_color="EAEAEA", fill_type="solid")
+                cell.border = grand_total_border
+            elif is_subtotal:
+                cell.font = Font(name="Calibri", size=9.5, bold=True)
+                cell.fill = PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
+                cell.border = top_bottom_border
+            else:
+                cell.font = Font(name="Calibri", size=9)
+
+            if is_subtotal or is_grand_total:
+                if col_idx == 2:
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                elif col_idx in [12, 13]:
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                if col_idx in [1, 2, 3, 4, 6, 7, 8, 9, 10, 11]:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_idx in [5]:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+
+        current_data_row += 1
+
+    # 6. Invoice Summary Block
+    if summary_rows:
+        current_data_row += 1
+        for s_row in summary_rows:
+            ws.cell(row=current_data_row, column=2, value="INVOICE DUE & PAYABLE AMOUNTS:").font = Font(name="Calibri", size=10, bold=True)
+            ws.cell(row=current_data_row, column=5, value=s_row[4]).font = Font(name="Calibri", size=10, bold=True)
+            ws.cell(row=current_data_row, column=9, value=s_row[9]).font = Font(name="Calibri", size=10, bold=True)
+            ws.cell(row=current_data_row, column=12, value=s_row[11]).font = Font(name="Calibri", size=10, bold=True)
+            current_data_row += 1
+
+    # 7. Column Widths
+    col_widths = {
+        1: 14, 2: 12, 3: 12, 4: 10, 5: 18, 6: 12, 7: 13,
+        8: 15, 9: 13, 10: 13, 11: 15, 12: 16, 13: 16
+    }
+    for c_idx, width in col_widths.items():
+        col_letter = get_column_letter(c_idx)
+        ws.column_dimensions[col_letter].width = width
+
+    try:
+        wb.save(output_excel_path)
+        logger.info(f"PAA Aviobridge Charges converted successfully: {output_excel_path} ({len(all_flight_rows)} rows)")
+    except PermissionError:
+        error_msg = f"Permission denied writing to '{output_excel_path}'. Please close the file if open."
+        logger.error(error_msg)
+        raise PermissionError(error_msg)
+
+    if logo_path and os.path.exists(logo_path):
+        try: os.remove(logo_path)
+        except Exception: pass
+
+    df_preview = pd.DataFrame(all_flight_rows, columns=PAA_AB_HEADERS)
+    return df_preview, output_excel_path
+
+
+# ==============================================================================
 # 2B. SAUDI AIRPORT OPERATIONS & LANDING CHARGE INVOICE (DYNAMIC 20/22 COLUMNS)
 # ==============================================================================
 DAMMAM_DETAIL_HEADERS = [
@@ -858,6 +1209,448 @@ JEDDAH_DETAIL_HEADERS = [
     "Aircraft Type",
     "Flight No.",
 ]
+
+
+# ==============================================================================
+# 1D. AUTONOMOUS DYNAMIC TABLE & DOCUMENT ENGINE
+# ==============================================================================
+def parse_dynamic_number(v_str: Any) -> Optional[Any]:
+    """Parses numeric string to native int or float if cleanly formatted, else None."""
+    if v_str is None:
+        return None
+    s = str(v_str).strip().replace(",", "")
+    if re.fullmatch(r"[-+]?\d+", s):
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    if re.fullmatch(r"[-+]?\d+\.\d+", s):
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
+
+
+def group_words_dynamic(words: List[Dict], y_tol: float = 3.5) -> List[List[Dict]]:
+    """Groups words into horizontal lines with strict left-to-right sorting."""
+    if not words:
+        return []
+    sorted_words = sorted(words, key=lambda w: (w['top'], w['x0']))
+    lines: List[List[Dict]] = []
+    curr_line: List[Dict] = []
+    curr_top: Optional[float] = None
+    for w in sorted_words:
+        if curr_top is None:
+            curr_top = w['top']
+            curr_line.append(w)
+        elif abs(w['top'] - curr_top) <= y_tol:
+            curr_line.append(w)
+        else:
+            curr_line.sort(key=lambda x: x['x0'])
+            lines.append(curr_line)
+            curr_line = [w]
+            curr_top = w['top']
+    if curr_line:
+        curr_line.sort(key=lambda x: x['x0'])
+        lines.append(curr_line)
+    return lines
+
+
+def build_dynamic_document_excel(
+    pdf_path: str,
+    output_excel_path: str,
+    sheet_name: str = "Sheet1"
+) -> Tuple[pd.DataFrame, str]:
+    """
+    Autonomous Dynamic Table & Document Engine:
+    Dynamically analyzes incoming PDF layout, discovers headers, column boundaries,
+    multi-page data rows, subtotal/grand total accounting rows, auto-inferred numeric typing,
+    metadata blocks, and trailing financial notes.
+    Exports unified output onto a single continuous sheet ('Sheet1').
+    """
+    logger.info(f"Dynamic Table & Document Engine processing: {pdf_path}")
+    parent_dir = os.path.dirname(os.path.abspath(output_excel_path))
+    if parent_dir and not os.path.exists(parent_dir):
+        os.makedirs(parent_dir, exist_ok=True)
+
+    logo_path = None
+    title_block: List[str] = []
+    metadata_items: List[str] = []
+    col_names: List[str] = []
+    col_intervals: List[Tuple[str, float, float]] = []
+    all_data_rows: List[List[str]] = []
+    grand_total_info: Dict[str, Any] = {}
+    financial_summary_items: List[str] = []
+    notes: List[str] = []
+
+    header_keywords = [
+        "SR#", "BILL", "NO.", "DATE", "AMOUNT", "CHARGES", "DESCRIPTION", "QTY", "QUANTITY",
+        "RATE", "PRICE", "TOTAL", "FLIGHT", "ITEM", "CODE", "TAX", "ID", "NAME", "ACCOUNT",
+        "REG", "TYPE", "TIME", "STATUS", "DISTANCE", "PKR", "US$", "DUE", "BRIDGE"
+    ]
+
+    with pdfplumber.open(pdf_path) as pdf:
+        p1 = pdf.pages[0]
+        page_width = float(p1.width)
+        words_p1 = p1.extract_words()
+        lines_p1 = group_words_dynamic(words_p1, y_tol=3.5)
+
+        # 1. Logo Extraction (Page 1 top header)
+        if p1.images:
+            try:
+                img_obj = p1.images[0]
+                if img_obj.get('top', 0) < 120:
+                    temp_logo = os.path.join(parent_dir, f"dynamic_logo_{os.getpid()}.png")
+                    cropped = p1.crop((img_obj['x0'], img_obj['top'], img_obj['x1'], img_obj['bottom'])).to_image(resolution=150)
+                    cropped.save(temp_logo)
+                    logo_path = temp_logo
+            except Exception as e:
+                logger.warning(f"Could not extract logo: {e}")
+                logo_path = None
+
+        # 2. Header & Column Discovery on Page 1
+        header_line_idx = -1
+        header_chunks: List[List[Dict]] = []
+        for idx, line in enumerate(lines_p1):
+            chunks: List[List[Dict]] = []
+            curr: List[Dict] = []
+            for w in line:
+                if not curr or (w['x0'] - curr[-1]['x1'] < 16.0):
+                    curr.append(w)
+                else:
+                    chunks.append(curr)
+                    curr = [w]
+            if curr:
+                chunks.append(curr)
+            line_str = " ".join(w['text'] for w in line)
+
+            # Check for title / metadata before table
+            if header_line_idx == -1:
+                # Table header candidate: >= 3 spaced chunks matching header keywords
+                kw_matches = sum(1 for k in header_keywords if k in line_str.upper())
+                if len(chunks) >= 3 and kw_matches >= 2:
+                    header_line_idx = idx
+                    header_chunks = chunks
+                else:
+                    if any(k in line_str for k in ["PAKISTAN AIRPORTS AUTHORITY", "SUMMARY OF AERONAUTICAL", "PAA-001"]):
+                        title_block.append(line_str)
+                    elif ":" in line_str and not any(k in line_str for k in ["PAGE NO:", "pm", "am", "PAGE "]):
+                        metadata_items.append(line_str)
+
+        if header_line_idx == -1:
+            raise ValueError(f"Could not dynamically discover table headers in {pdf_path}")
+
+        # Check for sub-header line (e.g. (RS.) IF ANY)
+        sub_headers: List[List[Dict]] = []
+        if header_line_idx + 1 < len(lines_p1):
+            next_line = lines_p1[header_line_idx + 1]
+            next_str = " ".join(w['text'] for w in next_line)
+            if any(k in next_str for k in ["(RS.)", "(US$)", "IF ANY", "PKR", "(TONS)"]):
+                sub_chunks: List[List[Dict]] = []
+                curr = []
+                for w in next_line:
+                    if not curr or (w['x0'] - curr[-1]['x1'] < 16.0):
+                        curr.append(w)
+                    else:
+                        sub_chunks.append(curr)
+                        curr = [w]
+                if curr:
+                    sub_chunks.append(curr)
+                sub_headers = sub_chunks
+
+        # Merge sub-headers into col_names based on horizontal overlap
+        for c in header_chunks:
+            txt = " ".join(w['text'] for w in c)
+            cx = (c[0]['x0'] + c[-1]['x1']) / 2
+            for sc in sub_headers:
+                sc_cx = (sc[0]['x0'] + sc[-1]['x1']) / 2
+                if abs(sc_cx - cx) < 30.0 or (c[0]['x0'] - 10 <= sc_cx <= c[-1]['x1'] + 10):
+                    txt += " " + " ".join(w['text'] for w in sc)
+                    break
+            txt = txt.replace("( ", "(").replace(" )", ")")
+            col_names.append(txt.strip())
+
+        n_cols = len(header_chunks)
+        for i in range(n_cols):
+            x_start = 0.0 if i == 0 else (header_chunks[i-1][-1]['x1'] + header_chunks[i][0]['x0']) / 2
+            x_end = page_width if i == n_cols - 1 else (header_chunks[i][-1]['x1'] + header_chunks[i+1][0]['x0']) / 2
+            col_intervals.append((col_names[i], x_start, x_end))
+
+        header_y_max = max(w['bottom'] for w in lines_p1[header_line_idx + (1 if sub_headers else 0)])
+
+        # 3. Extract Rows Across All Pages
+        first_header_token = header_chunks[0][0]['text']
+        second_header_token = header_chunks[1][0]['text'] if n_cols > 1 else ""
+
+        in_financial_summary = False
+        in_notes = False
+
+        for p_idx, page in enumerate(pdf.pages):
+            p_words = page.extract_words()
+            p_lines = group_words_dynamic(p_words, y_tol=3.5)
+            p_text = page.extract_text() or ""
+            is_table_page = (first_header_token in p_text and second_header_token in p_text)
+
+            for line in p_lines:
+                line_str = " ".join(w['text'] for w in line)
+                line_y = line[0]['top']
+
+                # Skip header block on page 1
+                if p_idx == 0 and line_y <= header_y_max:
+                    continue
+                # Skip running headers
+                if any(k in line_str for k in ["PAKISTAN AIRPORTS AUTHORITY", "PAA-001-FNBL", "PAGE NO:", "SUMMARY OF AERONAUTICAL BILLS"]):
+                    continue
+                if re.search(r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b', line_str, re.IGNORECASE):
+                    continue
+                if re.search(r'\b\d{1,2}:\d{2}\s*(?:am|pm)\b', line_str, re.IGNORECASE):
+                    continue
+                if first_header_token in line_str and second_header_token in line_str:
+                    continue
+                if "(RS.)" in line_str and "IF ANY" in line_str:
+                    continue
+                if "AIRLINE :" in line_str:
+                    continue
+
+                # Check for Grand Total line
+                if "TOTAL AMOUNT DUE" in line_str.upper():
+                    grand_total_match = re.search(r'TOTAL AMOUNT DUE[^\d]*([\d,]+)', line_str, re.IGNORECASE)
+                    if grand_total_match:
+                        grand_total_info['label'] = "TOTAL AMOUNT DUE FOR FORTNIGHT :"
+                        grand_total_info['amount'] = int(grand_total_match.group(1).replace(",", ""))
+                    in_financial_summary = True
+                    continue
+
+                # Financial summary items (Page 5)
+                if in_financial_summary:
+                    if "NOTE" in line_str.upper():
+                        in_notes = True
+                        in_financial_summary = False
+                        notes.append(line_str)
+                        continue
+                    if any(k in line_str.upper() for k in ["ARREARS", "SURCHARGE", "KIBOR", "TOTAL ARREARS", "TOTAL AMOUNT PAYABLE"]):
+                        financial_summary_items.append(line_str)
+                        continue
+
+                if in_notes:
+                    notes.append(line_str)
+                    continue
+
+                if not is_table_page:
+                    continue
+
+                # Table row
+                row = [""] * n_cols
+                for w in line:
+                    cx = (w['x0'] + w['x1']) / 2
+                    for c_idx, (_, x0, x1) in enumerate(col_intervals):
+                        if x0 <= cx < x1:
+                            if row[c_idx]:
+                                row[c_idx] += " " + w['text']
+                            else:
+                                row[c_idx] = w['text']
+                            break
+
+                # Check if it's a valid data row (e.g. starts with serial number or ID)
+                if row[0] and row[0].isdigit():
+                    all_data_rows.append(row)
+
+    logger.info(f"Dynamic Engine extracted {len(all_data_rows)} data rows across {len(col_names)} columns.")
+
+    # 4. Build Excel Workbook
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+    ws.views.sheetView[0].showGridLines = True
+
+    thin_border = Side(style='thin', color='000000')
+    double_border = Side(style='double', color='000000')
+    cell_border = Border(left=thin_border, right=thin_border, top=thin_border, bottom=thin_border)
+    grand_total_border = Border(top=thin_border, bottom=double_border, left=thin_border, right=thin_border)
+
+    title_font = Font(name="Calibri", size=14, bold=True)
+    subtitle_font = Font(name="Calibri", size=11, bold=True)
+    meta_font = Font(name="Calibri", size=10, bold=True)
+    header_font = Font(name="Calibri", size=10, bold=True)
+    header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    data_font = Font(name="Calibri", size=10)
+    total_font = Font(name="Calibri", size=10, bold=True)
+    total_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+    note_font = Font(name="Calibri", size=9)
+    note_bold = Font(name="Calibri", size=9, bold=True)
+
+    # A. Logo
+    if logo_path and os.path.exists(logo_path):
+        try:
+            img = openpyxl.drawing.image.Image(logo_path)
+            img.width = 110
+            img.height = 45
+            ws.add_image(img, "B2")
+        except Exception as e:
+            logger.warning(f"Failed to add logo image to Excel: {e}")
+
+    # B. Title Block
+    cur_row = 2
+    for t_line in title_block:
+        if "PAKISTAN AIRPORTS AUTHORITY" in t_line:
+            cell = ws.cell(row=cur_row, column=3, value="PAKISTAN AIRPORTS AUTHORITY")
+            cell.font = title_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            if "PAA-001-FNBL-1.0" in t_line:
+                ref_cell = ws.cell(row=cur_row, column=n_cols, value="PAA-001-FNBL-1.0")
+                ref_cell.font = Font(name="Calibri", size=9, bold=True)
+                ref_cell.alignment = Alignment(horizontal="right", vertical="center")
+        elif "SUMMARY OF AERONAUTICAL BILLS" in t_line:
+            cell = ws.cell(row=cur_row, column=3, value=t_line)
+            cell.font = subtitle_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        cur_row += 1
+
+    cur_row += 1
+    for m_line in metadata_items:
+        cell = ws.cell(row=cur_row, column=2, value=m_line)
+        cell.font = meta_font
+        cur_row += 1
+
+    cur_row += 1
+    table_start_row = cur_row
+
+    # C. Master Table Headers
+    ws.row_dimensions[cur_row].height = 24
+    for c_idx, h_name in enumerate(col_names, start=1):
+        cell = ws.cell(row=cur_row, column=c_idx, value=h_name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = cell_border
+    cur_row += 1
+
+    # D. Infer Column Data Types
+    col_types = []
+    for c_idx in range(n_cols):
+        vals = [r[c_idx] for r in all_data_rows if r[c_idx].strip()]
+        if not vals:
+            col_types.append("empty")
+            continue
+        int_count = sum(1 for v in vals if parse_dynamic_number(v) is not None and isinstance(parse_dynamic_number(v), int))
+        float_count = sum(1 for v in vals if parse_dynamic_number(v) is not None and isinstance(parse_dynamic_number(v), float))
+        if c_idx == 0:
+            col_types.append("int")
+        elif c_idx == 1:
+            col_types.append("str")
+        elif int_count == len(vals):
+            col_types.append("int")
+        elif (int_count + float_count) == len(vals):
+            col_types.append("float")
+        else:
+            col_types.append("str")
+
+    # E. Populate Data Rows
+    for r_vals in all_data_rows:
+        ws.row_dimensions[cur_row].height = 19
+        for c_idx, val in enumerate(r_vals, start=1):
+            cell = ws.cell(row=cur_row, column=c_idx)
+            cell.border = cell_border
+            cell.font = data_font
+
+            c_type = col_types[c_idx - 1]
+            if c_type == "int":
+                parsed = parse_dynamic_number(val)
+                if parsed is not None:
+                    cell.value = parsed
+                    cell.number_format = '#,##0'
+                    cell.alignment = Alignment(horizontal="right" if c_idx > 1 else "center", vertical="center")
+                else:
+                    cell.value = val
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif c_type == "float":
+                parsed = parse_dynamic_number(val)
+                if parsed is not None:
+                    cell.value = parsed
+                    cell.number_format = '#,##0.00'
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                else:
+                    cell.value = val
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                cell.value = val
+                align = "center" if any(k in col_names[c_idx - 1].upper() for k in ["DATE", "SR#", "CODE", "REG"]) else "left"
+                cell.alignment = Alignment(horizontal=align, vertical="center")
+        cur_row += 1
+
+    # F. Grand Total Row
+    if grand_total_info:
+        ws.row_dimensions[cur_row].height = 22
+        for c_idx in range(1, n_cols + 1):
+            cell = ws.cell(row=cur_row, column=c_idx)
+            cell.border = grand_total_border
+            cell.font = total_font
+            cell.fill = total_fill
+
+        lbl_cell = ws.cell(row=cur_row, column=2, value=grand_total_info.get('label', 'TOTAL AMOUNT DUE :'))
+        lbl_cell.alignment = Alignment(horizontal="left", vertical="center")
+
+        # Amount placed in column 4 (AMOUNT BILLED) or last numeric column
+        tot_cell = ws.cell(row=cur_row, column=4 if n_cols >= 4 else n_cols, value=grand_total_info.get('amount', 0))
+        tot_cell.number_format = '#,##0'
+        tot_cell.alignment = Alignment(horizontal="right", vertical="center")
+        cur_row += 2
+
+    # G. Financial Summary Block (Page 5)
+    if financial_summary_items:
+        for f_item in financial_summary_items:
+            ws.row_dimensions[cur_row].height = 18
+            parts = f_item.rsplit(" ", 1)
+            if len(parts) == 2 and parse_dynamic_number(parts[1]) is not None:
+                lbl = ws.cell(row=cur_row, column=2, value=parts[0].strip())
+                lbl.font = Font(name="Calibri", size=10, bold=True)
+                val_c = ws.cell(row=cur_row, column=4 if n_cols >= 4 else n_cols, value=int(parts[1].replace(",", "")))
+                val_c.font = Font(name="Calibri", size=10, bold=True)
+                val_c.number_format = '#,##0'
+                val_c.alignment = Alignment(horizontal="right", vertical="center")
+            else:
+                lbl = ws.cell(row=cur_row, column=2, value=f_item)
+                lbl.font = Font(name="Calibri", size=10, bold=True)
+            cur_row += 1
+        cur_row += 1
+
+    # H. Notes Section
+    if notes:
+        ws.row_dimensions[cur_row].height = 18
+        note_hdr = ws.cell(row=cur_row, column=2, value="NOTE:")
+        note_hdr.font = note_bold
+        cur_row += 1
+        for n_line in notes:
+            if n_line.strip() == "NOTE:":
+                continue
+            ws.row_dimensions[cur_row].height = 16
+            nc = ws.cell(row=cur_row, column=2, value=n_line.strip())
+            nc.font = note_font
+            cur_row += 1
+
+    # Auto-fit column widths
+    for c in range(1, n_cols + 1):
+        col_letter = get_column_letter(c)
+        max_len = 0
+        for r in range(table_start_row, cur_row):
+            val = str(ws.cell(row=r, column=c).value or "")
+            if len(val) > max_len:
+                max_len = len(val)
+        ws.column_dimensions[col_letter].width = min(max(max_len + 4, 12), 40)
+
+    try:
+        wb.save(output_excel_path)
+        logger.info(f"Dynamic Excel exported successfully: {output_excel_path} ({len(all_data_rows)} rows)")
+    finally:
+        if logo_path and os.path.exists(logo_path):
+            try:
+                os.remove(logo_path)
+            except Exception:
+                pass
+
+    df_preview = pd.DataFrame(all_data_rows, columns=col_names)
+    return df_preview, output_excel_path
 
 
 def build_saudi_landing_charge_excel(
@@ -2489,6 +3282,14 @@ def convert_pdf_to_excel(
                     sheet_name=sheet_name
                 )
 
+            # Specialized Route 2B: PAA Aviobridge Charges Bill
+            elif doc_type == "PAA_AVIOBRIDGE":
+                return build_aviobridge_excel(
+                    pdf_path=pdf_path,
+                    output_excel_path=output_excel_path,
+                    sheet_name=sheet_name
+                )
+
             # Specialized Route 3: Saudi Airports Authority Landing Charge Invoice (Jeddah, Dammam, Riyadh, etc.)
             elif doc_type in ["SAUDI_LANDING_CHARGE", "DAMMAM_LANDING_CHARGE"]:
                 return build_saudi_landing_charge_excel(
@@ -2508,6 +3309,14 @@ def convert_pdf_to_excel(
             # Specialized Route 5: Dubai Airports Corporation Tax Invoice
             elif doc_type == "DUBAI_AIRPORTS":
                 return build_dubai_airports_excel(
+                    pdf_path=pdf_path,
+                    output_excel_path=output_excel_path,
+                    sheet_name=sheet_name
+                )
+
+            # Dynamic Route: PAA Summary of Aeronautical Bills & Autonomous Layouts
+            elif doc_type in ["PAA_AERONAUTICAL_SUMMARY", "DYNAMIC_DOCUMENT"]:
+                return build_dynamic_document_excel(
                     pdf_path=pdf_path,
                     output_excel_path=output_excel_path,
                     sheet_name=sheet_name
